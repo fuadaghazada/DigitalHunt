@@ -1,0 +1,1243 @@
+`timescale 1ns / 1ps
+
+module Main(
+            input logic clk, reset, right, left, up, down, fire, start,
+            output logic hsync, vsync, tempLed, dp,
+            output logic [3:0] red,
+            output logic [3:0] green,
+            output logic [3:0] blue,
+            output logic [6:0] leds,
+            output logic [3:0] anode,
+            
+            output  logic oe, 
+            output logic  SH_CP, 
+            output logic ST_CP, 
+            output logic reset2, 
+            output logic DS,
+            output logic [7:0] rows 
+            );
+ 
+    logic vidOn;
+    logic [9:0] pixelX;
+    logic [9:0] pixelY;
+    
+    logic [9:0] width;
+    logic [9:0] height;
+    logic [9:0] X;
+    logic [9:0] Y;
+    logic dir;
+    
+    logic [9:0] width_cursor;
+    logic [9:0] height_cursor;
+    logic [9:0] X_cursor;
+    logic [9:0] Y_cursor;
+    logic fired;
+    
+    logic [1:0] background;
+    logic [1:0] screen; //endscreen
+    logic [1:0] screen2; //main screen
+    
+    logic vgaClk;
+    logic gateClk1;
+    logic gateClk2;
+    logic gateClk3;
+    logic gateClkOut;
+    logic cursorClk;
+    
+    logic [3:0] score;
+    logic [1:0] diffLevel;
+    logic [2:0] missed;
+    logic isGameOver;
+    logic isWon;
+    
+    
+    logic firstDigit;
+    logic [3:0] secondDigit;
+    always
+    begin
+        if(score < 10)
+        begin
+            firstDigit <= 0;
+            secondDigit <= score;
+        end    
+        else
+        begin
+            firstDigit <= 1;
+            secondDigit <= score - 10;
+        end     
+    end        
+              
+    always
+        tempLed <= fired;    
+   
+    ClockDivider clkdvdr(clk, reset, vgaClk, gateClk1, gateClk2, gateClk3, cursorClk);
+    
+    SpeedOfGates sog(clk, gateClk1, gateClk2, gateClk3, diffLevel, gateClkOut);
+    
+    VGA_Monitor vga(vgaClk, reset, hsync, vsync, vidOn, pixelX, pixelY);
+    
+    IsShot is(cursorClk, X, Y, height, width, X_cursor, Y_cursor, fire, fired);
+    
+    GameState gs(gateClkOut, reset, fired, diffLevel, isWon, score);
+    
+    SevSeg_4digit svndgt(clk, diffLevel + 1, 7 - missed, firstDigit, secondDigit, leds[6], leds[5], leds[4], leds[3], leds[2], leds[1], leds[0], dp, anode);
+    
+    DotMatrix dm(clk, diffLevel, oe, SH_CP, ST_CP, reset2, DS, rows);
+    
+    Crosshair crs(cursorClk, reset,  X_cursor, Y_cursor, right, left, up, down, X_cursor, Y_cursor);
+    
+    FlyingGates gates(gateClkOut, reset, fired, isWon, start, X, Y, isGameOver, dir, missed, height, width, X, Y);
+    
+    Background bg(vgaClk, dir, pixelX, pixelY, X, Y, height, width, X_cursor, Y_cursor, background);
+    
+    EndScreen(vgaClk, pixelX, pixelY, screen);
+      
+    StartScreen(vgaClk, pixelX, pixelY, screen2);  
+      
+    Color c(clk, reset, start, background, vidOn, isGameOver, isWon, screen, screen2, red, green, blue);
+     
+                
+            
+endmodule
+
+-----------------------------------------------------------------------
+`timescale 1ns / 1ps
+
+module ClockDivider(
+                    input logic clk, reset,
+                    output vgaClk, gateClock1, gateClock2, gateClock3, cursorClock
+                    );
+                    
+    logic [26:0] count;
+    logic [10:0] count2;
+    
+    always_ff @ (posedge clk, posedge reset)
+    begin
+        if(reset)
+            count <= 0;
+        else
+            count <= count + 1;     
+    end
+    
+    always_ff @ (posedge clk, posedge reset)
+    begin
+        if(reset)
+            count2 <= 0;
+        else
+            count2 <= count2 + 1;     
+    end
+    
+    assign vgaClk = count2[1];
+    assign gateClock1 = count[22];
+    assign gateClock2 = count[21];
+    assign gateClock3 = count[20];
+    assign cursorClock = count[20];
+                        
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module SpeedOfGates(
+                    input logic clk, clk1, clk2, clk3, 
+                    input logic [1:0] diff, 
+                    output logic clock_out
+                    );
+    
+    always_ff @(posedge clk)
+        case(diff)
+        
+            2'b00: begin 
+                        clock_out <= clk1;
+                   end
+            2'b01: begin
+                        clock_out <= clk2;
+                   end            
+            2'b10: begin 
+                        clock_out <= clk3;
+                   end     
+            
+            default : begin
+                        clock_out <= clk1;
+                      end
+        endcase       
+                            
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module VGA_Monitor (
+                      input logic vgaclk, //25Mhz
+                      input logic reset, //asynchronus reset
+                      output logic hsync,
+                      output logic vsync,
+                      output logic vidOn, //Looks when the screen is active
+                      output logic [9:0]pixelX, //x goes up to 640 so we need 10 bits because 2^9=512 and 2^10=1024
+                      output logic [9:0]pixelY);
+                      
+    parameter maximumHorizontalPixels = 800; //MAximum pixels in a line
+    parameter hbp = 144; //End of the horizontal back porch time
+    parameter hfp = 784; //Start of horizontal front porch time
+    parameter hPulse = 96;
+    
+    parameter maximumVerticalLines = 521; //Maximum lines in the screen
+    parameter vbp = 30; //End of the vertical back porch time
+    parameter vfp = 511; //Start of vertical front porch time
+    parameter vPulse = 2;   
+    
+    
+    logic [9:0] hcnt;
+    logic [9:0] vcnt;
+    
+    always @(posedge vgaclk, posedge reset)
+        begin
+            if (reset)
+            begin
+                hcnt <= 0;
+                vcnt <= 0;
+            end
+            else
+            begin
+                if (hcnt < maximumHorizontalPixels - 1)
+                    hcnt <= hcnt + 1;
+                else
+                begin
+                    hcnt <= 0;
+                    if (vcnt < maximumVerticalLines - 1)
+                        vcnt <= vcnt + 1;
+                    else
+                        vcnt <= 0;
+                end
+                
+            end
+        end
+        
+    assign hsync = (hcnt < hPulse) ? 0:1;
+    assign vsync = (vcnt < vPulse) ? 0:1;
+    
+  
+    always_comb
+    begin
+        if (hcnt >= hbp && hcnt < hfp && vcnt >= vbp && vcnt < vfp)
+        begin
+            pixelX <= hcnt - hbp; // pixelX 
+            pixelY <= vcnt - vbp; // pixelY 
+            vidOn <= 1;           // active dýsplay
+        end
+        else
+        begin
+            pixelX <= 0;
+            pixelY <= 0;
+            vidOn <= 0; //ýnactýve dýsplay
+        end
+    end    
+	 	
+    
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module IsShot(
+                input logic clk,
+                input logic [9:0] gate_x,
+                input logic [9:0] gate_y,
+                input logic [9:0] gate_height,
+                input logic [9:0] gate_width,
+                input logic [9:0] cursor_x,
+                input logic [9:0] cursor_y,
+                input logic fire,
+                output logic out
+                );
+   always_ff @(posedge clk)
+        if(cursor_x > gate_x - gate_width/2 && cursor_x < gate_x + gate_width/2 && cursor_y > gate_y - (gate_height/2 + 5) && cursor_y < gate_y + (gate_height/2 + 5))
+             out <= fire;
+        else
+            out <= 1'b0;       
+    
+                    
+endmodule
+
+`timescale 1ns / 1ps
+
+module GameState(
+                  input logic clk, reset,
+                  input logic fired, 
+                  input logic [1:0] difficultyLevel,
+                  output logic isWon,
+                  output logic [3:0] score  
+                );
+    
+    logic [3:0] count;
+    logic [1:0] diffL;
+    
+    logic [3:0] levelCount;
+    
+    always_ff @(posedge clk, posedge reset)
+    begin
+        if(reset)
+            begin
+                count <= 4'b0;
+                diffL <= 2'b00;
+                isWon <= 0;
+                levelCount <= 4'b0101;
+            end
+        else if(fired)
+            begin       
+                
+                isWon <= 0;
+                
+                if(count < levelCount - 1)
+                    begin
+                        count <= count + 1;
+                    end 
+                else
+                    begin
+                        //count <= 3'b0;
+                        if(difficultyLevel < 2'b10)
+                            begin
+                                count <= count + 1;
+                                diffL <= diffL + 1;
+                                levelCount <= levelCount + 4'b0101;
+                            end
+                        else
+                            begin
+                                count <= count + 1;
+                                isWon <= 1'b1;
+                            end        
+                    end        
+            end
+        else 
+            begin
+                count <= count;
+
+            end            
+    end                
+    
+    assign score = {count};
+    assign difficultyLevel = {diffL};           
+                
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module SevSeg_4digit(
+                    input clk,
+                    input [3:0] in0, in1, in2, in3,        // 4 values for 4 digits (decimal value)
+                    output a, b, c, d, e, f, g, dp, //individual LED output for the 7-segment along with the digital point
+                    output [3:0] an   // anode: 4-bit enable signal (active low)
+                    );
+
+    // divide system clock (100Mhz for Basys3) by 2^N using a counter, which allows us to multiplex at lower speed
+    localparam N = 18;
+    logic [N-1:0] count = {N{1'b0}}; //initial value
+    
+    always@ (posedge clk)
+        count <= count + 1;
+
+    logic [3:0]digit_val; // 7-bit register to hold the current data on output
+    logic [3:0]digit_en;  //register for enable vector
+    
+    always_comb
+    begin
+        digit_en = 4'b1111; //default
+        digit_val = in0; //default
+
+        case(count[N-1:N-2]) //using only the 2 MSB's of the counter 
+
+            2'b00 :  //select first 7Seg.
+            begin
+                digit_val = in0;
+                digit_en = 4'b1110;
+            end
+    
+            2'b01:  //select second 7Seg.
+            begin
+                digit_val = in1;
+                digit_en = 4'b1101;
+            end
+            
+            2'b10:  //select third 7Seg.
+            begin
+                digit_val = in2;
+                digit_en = 4'b1011;
+            end
+            
+            2'b11:  //select forth 7Seg.
+            begin
+                digit_val = in3;
+                digit_en = 4'b0111;
+            end
+        endcase
+    end
+
+    //Convert digit number to LED vector. LEDs are active low.
+    logic [6:0] sseg_LEDs; 
+    always_comb
+    begin 
+        sseg_LEDs = 7'b1111111; //default
+        case(digit_val)
+            4'd0 : sseg_LEDs = 7'b1000000; //to display 0
+            4'd1 : sseg_LEDs = 7'b1111001; //to display 1
+            4'd2 : sseg_LEDs = 7'b0100100; //to display 2
+            4'd3 : sseg_LEDs = 7'b0110000; //to display 3
+            4'd4 : sseg_LEDs = 7'b0011001; //to display 4
+            4'd5 : sseg_LEDs = 7'b0010010; //to display 5
+            4'd6 : sseg_LEDs = 7'b0000010; //to display 6
+            4'd7 : sseg_LEDs = 7'b1111000; //to display 7
+            4'd8 : sseg_LEDs = 7'b0000000; //to display 8
+            4'd9 : sseg_LEDs = 7'b0010000; //to display 9
+            default : sseg_LEDs = 7'b0111111; //dash
+        endcase 
+    end
+
+    assign an = digit_en; 
+    assign {g, f, e, d, c, b, a} = sseg_LEDs; 
+    assign dp = 1'b1; //turn dp off
+
+endmodule
+
+
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 12/23/2016 04:03:17 PM
+// Design Name: 
+// Module Name: DotMatrix
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+-----------------------------------------------------------------------
+
+module DotMatrix(
+                input clk, 
+                input [1:0] a,
+                output  logic oe, //output enable
+                
+                output logic  SH_CP, // shift register clk pulse
+                output logic ST_CP, // store register clk pulse
+                output logic reset, // reset for the shift register
+                /*output reg [7:0] blue2,*/
+                output logic DS, // digital signal
+                /*output reg [7:0] KATOT,*/
+                output logic [7:0] rows      
+);
+            logic [24:1] message;
+            logic [7:0] red;
+            
+             initial begin
+                          red = 8'hFF;
+                          rows  =  8'b00000000;
+
+                       end
+         
+                
+               assign message[24:17] = red;
+               logic f;
+               logic e;
+               
+               logic [1:0] counter;
+               logic [8:0] i = 1; // --data signalin seri olarak iletilmesini kontrol eder.
+               logic [2:0] a = 0;
+               logic [9:0] d = 0;       
+               
+               
+               always@(posedge clk)
+                           begin
+                               counter = counter+1;
+                               f<= counter[1]; // clk signal for the shift register
+                               e<= ~f;
+                           end    
+                               //------------------------------------------------------------
+                           always@( posedge e)
+                               begin    
+                               //seri olarak datayý almak için her clk pulse tan sonra i bir arttýrýlýyor.
+                                   i = i+9'b000000001;
+                               end    
+                       
+                           always@(*)
+                               begin
+                                   if (i < 9'b000000100) // baþlangýçta i 4'e gelene kadar sisteme reset atýlýr.
+                                       reset<=0;
+                                   else
+                                       reset<=1;
+                                   if (i>9'b000000011 && i<9'b000011100) //4'le 27 arasýnda data akýþý seri olarak.
+                                       DS<=message[i-9'b000000011];
+                                   else 
+                                       DS<=0;
+                                       
+                                   if (i<9'b000011100) //i 28'e geldiðinde data akýþý datamlanýyor.24 bit data alýnmýþ oluyor. bu sureden sonra clk durduluyor yeni data akýþýna kadar.
+                                       begin
+                                           SH_CP<=f;             
+                                           ST_CP<=e;
+                                       end
+                                       
+                                   else
+                                       begin
+                                           SH_CP<=0;
+                                           ST_CP<=1;
+                                       end
+                       end
+                       always @(posedge f)//clk un durduðu surede OE=0 yani output registerin çýkýþýnda aktif durumda.
+                             begin
+                               if (i>9'b000011100 && i<9'b110011101)
+                                oe<=0;
+                               else
+                                      oe<=1;
+                               end        
+                              always @(posedge f) //bir satýr tamamlandýðýnda a bir arttýrýlýyor 2. satýra geçmek için.
+                               begin    
+                                       if (i==(9'b000011100 + 9'b110011101)/2)
+                                        begin
+                                   a = a;
+                                    
+                         end
+                       end
+                       
+                       always @(posedge f) //satrlar ve sutunlar tamamlandýðýnda yeni görüntü için(ful ekran) d bir arttýrýlýyor.
+                       begin    
+                             if (i==9'b110011110)
+                             if (a==7) 
+                                               d=d+1;
+                       end      
+                       
+                                logic[26:0] count=0;
+                                logic clk_en;
+                                always@(posedge clk)
+                                begin
+                                count<=count+1;
+                                if(count==27'd50000000)
+                                begin
+                                clk_en=1;
+                                count<=27'd0;
+                                end
+                                else
+                                clk_en=0;
+                                end  
+                                
+                            always@(a)
+                               begin
+                                
+                                    if(clk_en)
+                                    begin
+                                    case(a)
+                                    2'b00:begin
+                                    rows<=8'b00010000;
+                                    red<=8'b11011111;  
+                                    end
+                                    2'b01:begin
+                                    rows<=8'b00011000;
+                                    red<=8'b11111111;
+                                    end
+                                    2'b10:begin
+                                    rows<=8'b00011100;
+                                    red<=8'b11111111;
+                                    end
+
+                                    endcase                         
+                                    end
+                                end
+                       endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module Crosshair(
+                input logic clk, reset,
+                input logic [9:0] currentX,
+                input logic [9:0] currentY,
+                input logic right, left, up, down,
+                output logic [9:0] X,
+                output logic [9:0] Y                    
+             );
+    
+    //internal variables
+    parameter beginX = 320;            
+    parameter beginY = 240;
+       
+    always_ff@(posedge clk, posedge reset)
+       begin
+           if(reset)
+               begin
+                    currentX <= beginX;        //reseting the positons to the beginning
+                    currentY <= beginY;
+               end
+           else
+               begin
+                   if(right)
+                   begin
+                        if(currentX + 10 < 640)
+                            begin                     //end of the monitor
+                                currentX <= currentX + 10;
+                                currentY <= currentY;
+                            end
+                        else
+                           begin
+                               begin
+                                   currentX <= 0;
+                                   currentY <= currentY;
+                               end                         
+                           end            
+                   end
+                   
+                    else if(left)
+                    begin
+                      if(currentX - 10 > 0)   
+                          begin   //end of the monitor
+                                currentX <= currentX - 10;
+                                currentY <= currentY;
+                          end      
+                      else
+                         begin
+                             begin
+                                 currentX <= 640;
+                                 currentY <= currentY;
+                             end                         
+                         end            
+                    end 
+                    
+                     else if(up)
+                      begin
+                           if(currentY - 10 < 480)  
+                               begin    //end of the monitor
+                                    currentY <= currentY - 10;
+                                    currentX <= currentX;
+                               end     
+                           else
+                              begin
+                                  begin
+                                      currentX <= currentX;
+                                      currentY <= 480;
+                                  end                         
+                              end            
+                      end 
+                      
+                       else if(down)
+                        begin
+                             if(currentY + 10 > 0) 
+                                begin     //end of the monitor
+                                    currentY <= currentY + 10;
+                                    currentX <= currentX;
+                                end
+                             else
+                                begin
+                                    begin
+                                        currentX <= currentX;
+                                        currentY <= 0;
+                                    end                         
+                                end            
+                        end
+                        
+                        else
+                            begin
+                                currentX <= currentX;
+                                currentY <= currentY;
+                            end   
+                end
+        end
+   
+    //assigning outputs        
+    assign X = currentX;
+    assign Y = currentY;
+             
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module FlyingGates(
+                    input logic  clk, reset, fire, isWon, start,
+                    input logic [9:0] currentX, 
+                    input logic [9:0] currentY,                   
+                    output logic isGameOver, direction,
+                    output logic [2:0] miss,
+                    output logic [9:0] height, 
+                    output logic [9:0] width,
+                    output logic [9:0] outX, 
+                    output logic [9:0] outY
+                  );
+                             
+    //internal variables
+    parameter WIDTH =  10'b0000011110;
+    parameter HEIGHT = 10'b0000011110;
+    
+    //beginning x position
+    parameter beginX1 = 20;
+
+    //assigning the dimensions of the logic blocks
+    assign height = HEIGHT;
+    assign width = WIDTH;
+
+    //direction of the flying gate
+    logic dir;
+     
+    //missed shots
+    logic [2:0] missed;
+       
+     //internal constants for y
+     parameter Y0 = 40;
+     parameter Y1 = 100;
+     parameter Y2 = 160;
+     parameter Y3 = 220;
+     parameter Y4 = 280;         
+     parameter Y5 = 340;
+     parameter Y6 = 400;
+     parameter Y7 = 450;    
+   
+          
+     logic [2:0] count;
+     logic [2:0] select;
+
+    
+    //state regsiter
+    always_ff@(posedge clk, posedge reset)
+    begin
+        if(reset)
+            begin
+                 currentX <= beginX1;        //reseting the positons to the beginning
+                 select <= count;
+                 missed <= 0;
+            end
+        else
+            begin                          
+                if(count < 3'b111)
+                    count <= count + 1; 
+                else
+                    count <= 0;
+                
+                if(start)
+                    begin
+                    
+                    if(missed < 3'b111 && ~isWon)
+                    begin
+                        
+                        isGameOver <= 0;    
+                        
+                        if(~fire)
+                            case(dir)
+                            1'b0:
+                                begin
+                                  if(currentX < 640)
+                                    begin                           
+                                        currentX <= currentX + 10;
+                                                                        
+                                        if(count < 3'b111)
+                                            count <= count + 1; 
+                                        else
+                                            count <= 0;
+                                    end
+                                  else
+                                    begin
+                                        
+                                        if(missed < 3'b111)
+                                            missed <= missed + 1;  
+                                        
+                                        dir <= 1'b1;                   
+                                        select <= count;
+                                        
+                                    end
+                                end
+                            1'b1:
+                                begin
+                                  if(currentX > 0)
+                                    begin                           
+                                        currentX <= currentX - 10;
+                                        
+                                        if(count < 3'b111)
+                                            count <= count + 1; 
+                                        else
+                                            count <= 0;
+                                    end
+                                  else
+                                    begin
+                                        
+                                        if(missed < 3'b111)
+                                            missed <= missed + 1;  
+         
+                                        dir <= 1'b0;
+                                        select <= count;
+                                        
+                                    end
+                                end
+                            endcase
+                        else
+                            begin
+                                if(dir)
+                                    currentX <= 640;
+                                else
+                                    currentX <= 0;    
+                                select <= count;
+                            end
+                     end
+                      else if(isWon)
+                            begin
+                                currentX <= currentX;
+                                currentY <= currentY;
+                            end
+                         
+                            else
+                                begin
+                                    currentX <= currentX;
+                                    currentY <= currentY;
+                                    isGameOver <= 1'b1;
+                                end
+                            end            
+                else
+                begin
+                    currentX <= currentX;
+                    currentY <= currentY;        //reseting the positons to the beginning
+                    missed <= missed; 
+                end
+                end     
+                
+               
+     end
+
+     always_comb
+        case(select)
+             
+            3'b000 :  currentY <= Y5;
+            3'b001 :  currentY <= Y7;
+            3'b010 :  currentY <= Y2;
+            3'b011 :  currentY <= Y1;
+            3'b100 :  currentY <= Y4;
+            3'b101 :  currentY <= Y0;
+            3'b110 :  currentY <= Y6;
+            3'b111 :  currentY <= Y3;
+                      
+        endcase
+    
+    always_comb
+        begin
+            miss <= missed;
+            direction <= dir;
+        end
+
+    //assigning outputs      
+    assign outX = currentX;
+    assign outY = currentY;        
+
+                
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+module Background(
+                    input logic clk, dir,
+                    input logic [9:0] vga_x,
+                    input logic [9:0] vga_y,
+                    input logic [9:0] gate_x,
+                    input logic [9:0] gate_y,
+                    input logic [9:0] gate_height,
+                    input logic [9:0] gate_width,
+                    input logic [9:0] cursor_x,
+                    input logic [9:0] cursor_y,
+                    output logic [1:0] out 
+                  );
+    
+    logic [1:0] background;
+     
+    always_ff @ (posedge clk)
+    begin
+        if(vga_x >= gate_x - gate_width/2 && vga_x <= gate_x + gate_width/2 && vga_y >= gate_y - gate_height/2 && vga_y <= gate_y + gate_height/2 )
+            background <= 2'b00;
+        
+        else if(vga_x >= cursor_x - 1 &&  vga_y >= cursor_y - 1 && vga_y <= cursor_y + 1 && vga_x <= cursor_x + 1 )
+            background <= 2'b01;
+        else if(vga_x == cursor_x && vga_y <= cursor_y + 10 && vga_y >= cursor_y - 10)
+            background <= 2'b10;  
+        else if(vga_y == cursor_y && vga_x <= cursor_x + 10 && vga_x >= cursor_x - 10)
+            background <= 2'b10;       
+        else
+            background <= 2'b11;    
+        
+        case(dir)
+            1'b1:
+                begin
+                    if(vga_x >= gate_x + gate_width/2 && vga_x <= gate_x + 30 && vga_y <= gate_y + 10 && vga_y >= gate_y + 9)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x + gate_width/2 && vga_x <= gate_x + 30 && vga_y >= gate_y - 10 && vga_y <= gate_y - 9)
+                        background <= 2'b00;
+                    if(vga_x <= gate_x + gate_width/2 && vga_x >= gate_x && vga_y <= gate_y + gate_height/2 + 5 && vga_y >= gate_y - gate_height/2 - 5)
+                        background <= 2'b00;
+                    if(vga_x <= gate_x && vga_x >= gate_x - gate_width/2 + 4 && vga_y <= gate_y + gate_height/2 + 4 && vga_y >= gate_y - gate_height/2 - 4)
+                        background <= 2'b00;    
+                    if(vga_x <= gate_x - 1 && vga_x >= gate_x - gate_width/2 + 3 && vga_y <= gate_y + gate_height/2 + 3 && vga_y >= gate_y - gate_height/2 - 3)
+                        background <= 2'b00;
+                    if(vga_x <= gate_x - 2 && vga_x >= gate_x - gate_width/2 + 2 && vga_y <= gate_y + gate_height/2 + 2 && vga_y >= gate_y - gate_height/2 - 2)
+                        background <= 2'b00;
+                    if(vga_x <= gate_x - 3 && vga_x >= gate_x - gate_width/2 + 1 && vga_y <= gate_y + gate_height/2 + 1 && vga_y >= gate_y - gate_height/2 - 1)
+                        background <= 2'b00;
+                     if(vga_x <= gate_x - 4 && vga_x >= gate_x - gate_width/2 && vga_y <= gate_y + gate_height/2 && vga_y >= gate_y - gate_height/2 )
+                        background <= 2'b00;             
+                                         
+                end
+            1'b0:
+                begin
+                    if(vga_x <= gate_x - gate_width/2 && vga_x >= gate_x - 30 && vga_y <= gate_y + 10 && vga_y >= gate_y + 9)
+                        background <= 2'b00;
+                    if(vga_x <= gate_x - gate_width/2 && vga_x >= gate_x - 30 && vga_y >= gate_y - 10 && vga_y <= gate_y - 9)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x - gate_width/2 && vga_x <= gate_x && vga_y <= gate_y + gate_height/2 + 5 && vga_y >= gate_y - gate_height/2 - 5)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x && vga_x <= gate_x + gate_width/2 - 4 && vga_y <= gate_y + gate_height/2 + 4 && vga_y >= gate_y - gate_height/2 - 4)
+                        background <= 2'b00;    
+                    if(vga_x >= gate_x + 1 && vga_x <= gate_x + gate_width/2 - 3 && vga_y <= gate_y + gate_height/2 + 3 && vga_y >= gate_y - gate_height/2 - 3)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x + 2 && vga_x <= gate_x + gate_width/2 - 2 && vga_y <= gate_y + gate_height/2 + 2 && vga_y >= gate_y - gate_height/2 - 2)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x + 3 && vga_x <= gate_x + gate_width/2 - 1 && vga_y <= gate_y + gate_height/2 + 1 && vga_y >= gate_y - gate_height/2 - 1)
+                        background <= 2'b00;
+                    if(vga_x >= gate_x + 4 && vga_x <= gate_x + gate_width/2 && vga_y <= gate_y + gate_height/2  && vga_y >= gate_y - gate_height/2 )
+                        background <= 2'b00;                    
+                                        
+                end                         
+        endcase    
+            
+    end
+    
+    assign out = background; 
+                      
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+module EndScreen(
+                 input logic clk,
+                 input logic [9:0] vga_x,
+                 input logic [9:0] vga_y,
+                 output logic [1:0] out
+                );
+    
+    logic [1:0] screen;
+    
+    always_ff @(posedge clk)
+    begin
+        if(vga_x > 260 && vga_x < 300 && vga_y > 80 && vga_y < 120) //
+            screen <= 2'b01;
+        else if(vga_x > 360 && vga_x < 400 && vga_y > 80 && vga_y < 120) //
+            screen <= 2'b01;
+        else if(vga_x > 220 && vga_x < 260 && vga_y > 280 && vga_y < 320)
+            screen <= 2'b00;
+        else if(vga_x > 260 && vga_x < 400 && vga_y > 240 && vga_y < 280) //
+            screen <= 2'b01;   
+        else if(vga_x > 400 && vga_x < 440 && vga_y > 280 && vga_y < 320)
+            screen <= 2'b00;    
+        else if(vga_x > 220 && vga_x < 260 && vga_y > 200 && vga_y < 240)
+            screen <= 2'b10;        
+        else if(vga_x > 400 && vga_x < 440 && vga_y > 200 && vga_y < 240)
+            screen <= 2'b10;        
+        else
+            screen <= 2'b11;               
+    end 
+    
+    assign out = {screen};
+                    
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+module StartScreen(
+                 input logic clk,
+                 input logic [9:0] vga_x,
+                 input logic [9:0] vga_y,
+                 output logic [1:0] out
+                );
+    
+    logic [1:0] screen;
+    
+    parameter letter_height = 100;
+    parameter letter_width = 30;
+    
+    parameter a = 10;
+    parameter gap = 10;
+    
+    parameter beginPoint = 60;
+    parameter beginPoint1 = 80; //for D
+    parameter beginPoint2 = beginPoint1 + gap + letter_width; //for I
+    parameter beginPoint3 = beginPoint2 + gap + (letter_width/3); //for G
+    parameter beginPoint4 = beginPoint3 + gap + letter_width; //for I
+    parameter beginPoint5 = beginPoint4 + gap + (letter_width/3); //for T
+    parameter beginPoint6 = beginPoint5 + gap + letter_width; //for A
+    parameter beginPoint7 = beginPoint6 + gap + letter_width; //for L
+    
+    
+    parameter beginPoint8 = beginPoint7 + letter_width + 50;
+    parameter beginPoint9 = beginPoint8 + gap + letter_width;
+    parameter beginPoint10 = beginPoint9 + gap + letter_width;
+    parameter beginPoint11 = beginPoint10 + gap + letter_width;
+    
+    //play sign
+    parameter beginPointP = 240;
+    parameter beginXpoint = 260;
+    parameter length = 80;
+        
+    
+    
+    always_ff @(posedge clk)
+    begin
+        if(vga_x >= beginPoint1 && vga_x <= beginPoint1 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint1 + a && vga_x <= beginPoint1 + 2*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00; 
+        else if(vga_x >= beginPoint1 + a && vga_x <= beginPoint1 + 2*a && vga_y >= beginPoint + letter_height - a && vga_y <= beginPoint + letter_height  )
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint1 + 2*a && vga_x <= beginPoint1 + 3*a && vga_y >= beginPoint + a && vga_y <= beginPoint + letter_height - a)
+            screen <= 2'b00;
+        //
+        else if(vga_x >= beginPoint2 && vga_x <= beginPoint2 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        //
+        else if(vga_x >= beginPoint3 && vga_x <= beginPoint3 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+                screen <= 2'b00;
+        else if(vga_x >= beginPoint3 + a && vga_x <= beginPoint3 + 2*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+                screen <= 2'b00;                        
+        else if(vga_x >= beginPoint3 + a && vga_x <= beginPoint3 + 2*a && vga_y >= beginPoint + 4*a && vga_y <= beginPoint + 5*a)
+                screen <= 2'b00;
+        else if(vga_x >= beginPoint3 + a && vga_x <= beginPoint3 + 2*a && vga_y >= beginPoint + letter_height - a && vga_y <= beginPoint + letter_height)
+                screen <= 2'b00;
+        else if(vga_x >= beginPoint3 + 2*a && vga_x <= beginPoint3 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+                screen <= 2'b00;
+        else if(vga_x >= beginPoint3 + 2*a && vga_x <= beginPoint3 + 3*a && vga_y >= beginPoint + 4*a && vga_y <= beginPoint + letter_height)
+                screen <= 2'b00;                                                         
+        //
+        else if(vga_x >= beginPoint4 && vga_x <= beginPoint4 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;           
+        //
+        else if(vga_x >= beginPoint5 && vga_x <= beginPoint5 + a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint5 + a && vga_x <= beginPoint5 + 2*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint5 + 2*a && vga_x <= beginPoint5 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00;                          
+        //
+        else if(vga_x >= beginPoint6 && vga_x <= beginPoint6 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint6 + a && vga_x <= beginPoint6 + 2*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00;                        
+        else if(vga_x >= beginPoint6 + a && vga_x <= beginPoint6 + 2*a && vga_y >= beginPoint + 4*a && vga_y <= beginPoint + 5*a)
+            screen <= 2'b00;            
+        else if(vga_x >= beginPoint6 + 2*a && vga_x <= beginPoint6 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;             
+        //
+        else if(vga_x >= beginPoint7 && vga_x <= beginPoint7 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;           
+        else if(vga_x >= beginPoint7 + a && vga_x <= beginPoint7 + 3*a && vga_y >= beginPoint + letter_height - a && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;  
+        //
+        //
+        //
+        else if(vga_x >= beginPoint8 && vga_x <= beginPoint8 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint8 + a && vga_x <= beginPoint8 + 2*a && vga_y >= beginPoint + 4*a && vga_y <= beginPoint + 5*a)
+            screen <= 2'b00;            
+        else if(vga_x >= beginPoint8 + 2*a && vga_x <= beginPoint8 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        //     
+        else if(vga_x >= beginPoint9 && vga_x <= beginPoint9 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint9 + a && vga_x <= beginPoint9 + 2*a && vga_y >= beginPoint + letter_height - a && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;            
+        else if(vga_x >= beginPoint9 + 2*a && vga_x <= beginPoint9 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        //
+        else if(vga_x >= beginPoint10 && vga_x <= beginPoint10 + a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint10 + a && vga_x <= beginPoint10 + 15 && vga_y >= beginPoint + 4*a && vga_y <= beginPoint + 5*a)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint10 + 15 && vga_x <= beginPoint10 + 2*a && vga_y >= beginPoint + 5*a && vga_y <= beginPoint + 6*a)
+            screen <= 2'b00;                          
+        else if(vga_x >= beginPoint10 + 2*a && vga_x <= beginPoint10 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;            
+        //
+        else if(vga_x >= beginPoint11 && vga_x <= beginPoint11 + a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint11 + a && vga_x <= beginPoint11 + 2*a && vga_y >= beginPoint && vga_y <= beginPoint + letter_height)
+            screen <= 2'b00;
+        else if(vga_x >= beginPoint11 + 2*a && vga_x <= beginPoint11 + 3*a && vga_y >= beginPoint && vga_y <= beginPoint + a)
+            screen <= 2'b00;   
+        
+        //
+        else if(vga_x >= beginXpoint && vga_x <= beginXpoint + 10 && vga_y >= beginPointP && vga_y <= beginPointP + length)
+            screen <= 2'b01;
+        else if(vga_x >= beginXpoint + 10 && vga_x <= beginXpoint + 20 && vga_y >= beginPointP + 5 && vga_y <= beginPointP + length - 5)
+            screen <= 2'b01;
+        else if(vga_x >= beginXpoint + 20 && vga_x <= beginXpoint + 30 && vga_y >= beginPointP + 10 && vga_y <= beginPointP + length - 10)
+            screen <= 2'b01;
+        else if(vga_x >= beginXpoint + 30 && vga_x <= beginXpoint + 40 && vga_y >= beginPointP + 15 && vga_y <= beginPointP + length - 15)
+            screen <= 2'b01;                    
+        else if(vga_x >= beginXpoint + 40 && vga_x <= beginXpoint + 50 && vga_y >= beginPointP + 20 && vga_y <= beginPointP + length - 20)
+            screen <= 2'b01;                                                   
+        else if(vga_x >= beginXpoint + 50 && vga_x <= beginXpoint + 60 && vga_y >= beginPointP + 25 && vga_y <= beginPointP + length - 25)
+            screen <= 2'b01;   
+        else if(vga_x >= beginXpoint + 60 && vga_x <= beginXpoint + 70 && vga_y >= beginPointP + 30 && vga_y <= beginPointP + length - 30)
+            screen <= 2'b01;                                                   
+        else if(vga_x >= beginXpoint + 70 && vga_x <= beginXpoint + 80 && vga_y >= beginPointP + 35 && vga_y <= beginPointP + length - 35)
+            screen <= 2'b01;   
+                                                        
+        else
+            screen <= 2'b11;                               
+    end 
+    
+    assign out = {screen};
+                    
+endmodule
+
+-----------------------------------------------------------------------
+
+`timescale 1ns / 1ps
+
+
+module Color(
+             input logic clk, reset, start,
+             input logic [1:0] background, 
+             input logic vidOn, isGameOver, isWon,  
+             input logic [1:0] screen,
+             input logic [1:0] screen2,
+             output logic [3:0] red,
+             output logic [3:0] green,
+             output logic [3:0] blue     
+             );
+    
+    always_ff @(posedge clk)
+    begin
+         if(vidOn)
+                if(start)
+                begin
+                    if(~isGameOver && ~isWon)
+                        case(background)
+                            2'b00: 
+                                begin
+                                    red <= 4'b0000;
+                                    green <= 4'b0000;
+                                    blue <= 4'b1111;
+                                end
+                            2'b01:
+                                begin
+                                    red <= 4'b1111;
+                                    green <= 4'b0000;
+                                    blue <= 4'b0000;
+                                end
+                            2'b10:
+                                begin
+                                  red <= 4'b1111;
+                                  green <= 4'b1111;
+                                  blue <= 4'b1111;
+                                end    
+                            2'b11:
+                                begin
+                                 red <= 4'b0000;
+                                 green <= 4'b0000;
+                                 blue <= 4'b0000;
+                                end          
+                         endcase  
+                    else if(isWon)
+                        begin
+                            case (screen)
+                                2'b10:
+                                    begin
+                                        red <= 4'b0000;
+                                        green <= 4'b1111;
+                                        blue <= 4'b0000;
+                                    end 
+                                2'b01:
+                                    begin
+                                        red <= 4'b0000;
+                                        green <= 4'b1111;
+                                        blue <= 4'b0000;
+                                    end        
+                                2'b11:
+                                    begin
+                                        red <= 4'b0000;
+                                        green <= 4'b0000;
+                                        blue <= 4'b0000;
+                                    end    
+                            endcase    
+                        end
+                    else if(isGameOver)
+                        begin
+                            case (screen)
+                                2'b00:
+                                    begin
+                                        red <= 4'b1111;
+                                        green <= 4'b0000;
+                                        blue <= 4'b0000;
+                                    end 
+                                2'b01:
+                                    begin
+                                        red <= 4'b1111;
+                                        green <= 4'b0000;
+                                        blue <= 4'b0000;
+                                    end        
+                                2'b11:
+                                    begin
+                                        red <= 4'b0000;
+                                        green <= 4'b0000;
+                                        blue <= 4'b0000;
+                                    end    
+                            endcase    
+                        end
+                 end
+                 else
+                 begin   
+                    case(screen2)
+                     2'b00:
+                         begin
+                             red <= 4'b1000;
+                             green <= 4'b0000;
+                             blue <= 4'b0000;
+                         end
+                     2'b01:
+                         begin
+                             red <= 4'b0000;
+                             green <= 4'b1000;
+                             blue <= 4'b0000;
+                         end                         
+                     2'b11:
+                         begin
+                             red <= 4'b0000;
+                             green <= 4'b0000;
+                             blue <= 4'b0000;
+                         end                         
+                 endcase
+                 end                                     
+        else
+            begin
+                red <= 4'b0000;
+                green <= 4'b0000;
+                blue <= 4'b0000;
+            end     
+    end            
+endmodule
